@@ -1,206 +1,191 @@
-# views/database.py (NEW LOCATION: Must be inside your 'views' folder)
-import sqlite3
+# views/dashboard.py (UPDATED with CSV Export Function)
+import streamlit as st
+import plotly.express as px
 import pandas as pd
-from datetime import datetime
+from datetime import date
+from .database import get_data, get_list_data 
+import os 
 
-DB_NAME = "tilp_data.db"
+# --- NEW: Helper function to convert DataFrame to CSV for export ---
+@st.cache_data
+def convert_df_to_csv(df):
+    # Drop columns that are internal or not useful in an export
+    # 'media_path' contains server-local file paths, and 'numeric_status' is only for charting.
+    cols_to_drop = [col for col in ['media_path', 'numeric_status'] if col in df.columns]
+    # Use errors='ignore' in case 'numeric_status' hasn't been added to the df yet
+    df = df.drop(columns=cols_to_drop, errors='ignore') 
+    return df.to_csv(index=False).encode('utf-8')
+# -----------------------------------------------------------------
 
-# --- CORE DB FUNCTIONS ---
 
-def init_db():
-    """Creates all necessary tables, ensures schema is up-to-date, and populates initial admin/lists."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # 1. Table: Users (Staff & Parent Logins)
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY,
-        password TEXT,
-        role TEXT, 
-        child_link TEXT 
-    )''')
-    
-    # 2. Table: Children Profiles
-    c.execute('''CREATE TABLE IF NOT EXISTS children (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        child_name TEXT UNIQUE,
-        parent_username TEXT, 
-        date_of_birth TEXT
-    )''')
-    
-    # 3. Table: Custom Lists
-    c.execute('''CREATE TABLE IF NOT EXISTS disciplines (
-        name TEXT UNIQUE
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS goal_areas (
-        name TEXT UNIQUE
-    )''')
-    
-    # 4. Table: Progress Tracker (Minimal pre-migration schema)
-    c.execute('''CREATE TABLE IF NOT EXISTS progress (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        child_name TEXT,
-        discipline TEXT,
-        goal_area TEXT,
-        status TEXT,
-        notes TEXT
-        -- media_path is added via migration below
-    )''')
-    
-    # 5. Table: Session Plans
-    c.execute('''CREATE TABLE IF NOT EXISTS session_plans (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        lead_staff TEXT,
-        support_staff TEXT,
-        warm_up TEXT,
-        learning_block TEXT,
-        regulation_break TEXT,
-        social_play TEXT,
-        closing_routine TEXT,
-        materials_needed TEXT,
-        internal_notes TEXT
-    )''')
+def show_page():
+    # Retrieve the child filter from the session state (set in app.py during login)
+    child_filter = st.session_state.get("child_link", "All")
+    user_role = st.session_state.get("user_role", "guest")
 
-    # --- SCHEMA MIGRATION FIX: Add 'media_path' column if it is missing ---
+    # Fetch data and lists
     try:
-        # Check if column exists by trying to select it
-        c.execute("SELECT media_path FROM progress LIMIT 1")
-    except sqlite3.OperationalError:
-        # If it fails, the column is missing, so add it.
-        c.execute("ALTER TABLE progress ADD COLUMN media_path TEXT DEFAULT ''")
-        conn.commit()
-    
-    # --- Initial Data Load (Ensures admin/lists exist) ---
-    c.execute("INSERT OR IGNORE INTO users (username, password, role, child_link) VALUES (?, ?, ?, ?)",
-              ("adminuser", "admin123", "admin", "All"))
-    
-    for d in ["OT", "SLP", "BC", "ECE", "Assistant"]:
-        c.execute("INSERT OR IGNORE INTO disciplines (name) VALUES (?)", (d,))
+        df = get_data("progress")
         
-    for g in ["Regulation", "Communication", "Fine Motor", "Social Play"]:
-        c.execute("INSERT OR IGNORE INTO goal_areas (name) VALUES (?)", (g,))
+        if df.empty:
+            st.warning("No progress data recorded yet. Go to 'Progress Tracker' to add entries.")
+            return
+            
+        # --- FIX: CONVERT DATE COLUMN IMMEDIATELY AFTER FETCHING ---
+        # This ensures the 'date' column is a proper datetime object for all user roles.
+        df['date'] = pd.to_datetime(df['date']) 
+        # ----------------------------------------------------------
         
-    conn.commit()
-    conn.close()
+        # Fetch list of disciplines for the new filter
+        disciplines_list = get_list_data("disciplines")["name"].tolist()
+    except Exception as e:
+        st.error(f"Error loading progress data or lists. Error: {e}")
+        return
 
-def get_user(username, password):
-    """Retrieves user details for login."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
-    user = c.fetchone()
-    conn.close()
-    if user:
-        # Returns: (username, password, role, child_link)
-        return {"username": user[0], "password": user[1], "role": user[2], "child_link": user[3]}
-    return None
 
-def get_list_data(table_name):
-    """Retrieves all data from a list table (disciplines, goal_areas, children, users)."""
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
-    conn.close()
-    return df
-
-# --- CRUD Functions for Admin Tools ---
-
-def upsert_user(username, password, role, child_link):
-    """Inserts or updates a user. Password field is only updated if provided."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    if password:
-        c.execute("REPLACE INTO users (username, password, role, child_link) VALUES (?, ?, ?, ?)",
-                  (username, password, role, child_link))
+    # --- Header and Empty Check ---
+    if user_role == "parent":
+        st.header(f"🏡 My Child's Progress: {child_filter}")
+        st.info("This dashboard displays progress data collected by our staff for your child only.")
     else:
-        # If password is None, keep the existing password
-        c.execute("UPDATE users SET role=?, child_link=? WHERE username=?",
-                  (role, child_link, username))
-        c.execute("INSERT OR IGNORE INTO users (username, role, child_link) VALUES (?, ?, ?)",
-                  (username, role, child_link)) # Should only happen if password was null
-    conn.commit()
-    conn.close()
-
-def delete_user(username):
-    """Deletes a user."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE username=?", (username,))
-    conn.commit()
-    conn.close()
-
-def upsert_child(child_name, parent_username, date_of_birth=None):
-    """Inserts or updates a child profile."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # This uses INSERT OR REPLACE to simplify upsert logic on the child_name UNIQUE key
-    c.execute("INSERT OR REPLACE INTO children (child_name, parent_username, date_of_birth) VALUES (?, ?, ?)",
-              (child_name, parent_username, date_of_birth))
-    conn.commit()
-    conn.close()
-
-def delete_child(child_name):
-    """Deletes a child and removes their parent link from the users table."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # 1. Find the parent username to clear the child_link
-    c.execute("SELECT parent_username FROM children WHERE child_name=?", (child_name,))
-    parent = c.fetchone()
-    if parent and parent[0] != 'None':
-        # 2. Unlink the parent's child_link (set it to 'All' for safety/simplification)
-        c.execute("UPDATE users SET child_link='All' WHERE username=? AND child_link=?", (parent[0], child_name))
+        st.header("📊 Clinical Dashboard & Reports")
+        st.info("Review program-wide progress or filter by individual child, date, and discipline.")
         
-    # 3. Delete the child record
-    c.execute("DELETE FROM children WHERE child_name=?", (child_name,))
-    conn.commit()
-    conn.close()
+    
+    # --- Filtering Logic ---
 
-def upsert_list_item(table_name, item_name):
-    """Adds a new item to a custom list (disciplines or goal_areas)."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    try:
-        c.execute(f"INSERT OR IGNORE INTO {table_name} (name) VALUES (?)", (item_name,))
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    conn.close()
+    # 1. INITIAL FILTER: Handle Parent View
+    if child_filter != "All":
+        # Parent View: Filter data for their specific child
+        df_display = df[df["child_name"] == child_filter].copy()
+        if df_display.empty:
+            st.warning(f"No progress data found for {child_filter}.")
+            return
+        selected_child = child_filter
+    else:
+        # Staff/Admin View: Dynamic Filters
+        df_display = df.copy() 
+        
+        with st.expander("🔎 Filter Data", expanded=True):
+            
+            # 1. Child Filter (Existing)
+            child_list = ["All Children"] + sorted(df_display["child_name"].unique().tolist())
+            selected_child = st.selectbox("1. Select Child", child_list)
+            
+            if selected_child != "All Children":
+                df_display = df_display[df_display["child_name"] == selected_child].copy()
+            
+            # Handle case where the child filter results in empty data before applying date/discipline filters
+            if df_display.empty:
+                st.warning(f"No progress data found for the selected child: {selected_child}.")
+                return
+            
+            # 2. Date Range Filter
+            col_date_start, col_date_end = st.columns(2)
 
-def delete_list_item(table_name, item_name):
-    """Deletes an item from a custom list."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(f"DELETE FROM {table_name} WHERE name=?", (item_name,))
-    conn.commit()
-    conn.close()
+            min_date = df_display['date'].min().date() if not df_display.empty else date.today()
+            max_date = df_display['date'].max().date() if not df_display.empty else date.today()
 
-# --- Existing Progress/Planner Functions ---
+            start_date = col_date_start.date_input("2. Start Date", min_date)
+            end_date = col_date_end.date_input("3. End Date", max_date)
+            
+            if start_date > end_date:
+                st.error("Error: Start Date cannot be after End Date.")
+                return
 
-def get_data(table_name):
-    """Retrieves all data from a table."""
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
-    conn.close()
-    return df
+            df_display = df_display[
+                (df_display['date'].dt.date >= start_date) & 
+                (df_display['date'].dt.date <= end_date)
+            ].copy()
 
-def save_progress(date, child, discipline, goal, status, notes, media_path):
-    """Saves progress with the new media_path column."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO progress (date, child_name, discipline, goal_area, status, notes, media_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (date, child, discipline, goal, status, notes, media_path))
-    conn.commit()
-    conn.close()
+            # 3. Discipline Filter
+            discipline_options = ["All Disciplines"] + disciplines_list
+            selected_disciplines = st.multiselect("4. Filter by Discipline", discipline_options, default="All Disciplines")
 
-def save_plan(date, lead_staff, support_staff, warm_up, learning_block, regulation_break, social_play, closing_routine, materials_needed, internal_notes):
-    """Saves a new daily session plan entry."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''INSERT INTO session_plans (date, lead_staff, support_staff, warm_up, learning_block, regulation_break, social_play, closing_routine, materials_needed, internal_notes) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (date, lead_staff, support_staff, warm_up, learning_block, regulation_break, social_play, closing_routine, materials_needed, internal_notes))
-    conn.commit()
-    conn.close()
+            if "All Disciplines" not in selected_disciplines:
+                df_display = df_display[df_display["discipline"].isin(selected_disciplines)].copy()
+            
+            
+        if df_display.empty:
+            st.warning(f"No progress data found matching all selected filters.")
+            return
+
+        # --- NEW: CSV Export Button for Staff/Admin ---
+        # Determine a dynamic filename based on the filter
+        file_filter_name = selected_child.replace(" ", "_") if selected_child != "All Children" else "All_Children"
+        
+        # Place button in a visible spot
+        st.markdown("---")
+        st.download_button(
+            label="⬇️ Export Filtered Progress Data to CSV",
+            data=convert_df_to_csv(df_display.copy()), # Use a copy before sending to the function
+            file_name=f'TILP_Progress_Report_{file_filter_name}_{date.today().strftime("%Y%m%d")}.csv',
+            mime='text/csv',
+            key='download-csv'
+        )
+        # --- END NEW EXPORT FUNCTIONALITY ---
+
+
+    # --- Display Metrics and Charts (This part remains the same, operating on filtered data) ---
+    
+    st.divider()
+    
+    if selected_child == "All Children":
+        st.subheader("Program-Wide Metrics")
+    else:
+        st.subheader(f"Key Progress Metrics for {selected_child}")
+        
+    m1, m2, m3 = st.columns(3)
+    
+    m1.metric("Total Sessions Logged", len(df_display))
+    progress_count = len(df_display[df_display["status"] == "Progress"])
+    success_rate = round((progress_count / len(df_display)) * 100) if len(df_display) > 0 else 0
+    m2.metric("Positive Progress Rate", f"{success_rate}%")
+    latest_status = df_display.sort_values(by="date", ascending=False).iloc[0]["status"] if not df_display.empty else "N/A"
+    m3.metric("Latest Recorded Status", latest_status)
+
+    # CHARTS
+    st.divider()
+    
+    st.subheader(f"Goal Achievement Trend")
+    
+    status_map = {"Regression": 1, "Stable": 2, "Progress": 3}
+    # Use .loc to avoid SettingWithCopyWarning
+    df_display.loc[:, "numeric_status"] = df_display["status"].map(status_map)
+    
+    fig = px.line(df_display, x="date", y="numeric_status", color="goal_area",
+                  title="Status of Goals Over Time (1=Regression, 3=Progress)",
+                  markers=True)
+    
+    fig.update_layout(yaxis=dict(
+        tickvals=[1, 2, 3],
+        ticktext=["Regression", "Stable", "Progress"],
+        title="Performance Status"
+    ))
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+    # --- Recent Notes and Media Display ---
+    st.subheader("Recent Notes & Media")
+    
+    # Iterate through the filtered data and display notes/media
+    for index, row in df_display.sort_values(by="date", ascending=False).head(50).iterrows():
+        # --- FIX APPLIED: ADDED CHILD NAME TO THE DISPLAY LINE ---
+        st.markdown(f"**{row['date'].strftime('%Y-%m-%d')}** | **Child:** **{row['child_name']}** | **{row['discipline']}** | **Goal:** {row['goal_area']} | **Status:** **{row['status']}**")
+        st.markdown(f"**Notes:** {row['notes']}")
+        
+        # Check if media_path is non-null/non-empty and the file exists on the local disk
+        if pd.notna(row['media_path']) and row['media_path'] and os.path.exists(row['media_path']):
+            file_path = row['media_path']
+            # Get the file extension to determine the type
+            mime_type = os.path.splitext(file_path)[1].lower()
+            
+            with st.expander(f"View Attached Media ({os.path.basename(file_path)})"):
+                if mime_type in ['.jpg', '.jpeg', '.png']:
+                    st.image(file_path, caption="Therapist Media", use_column_width=True)
+                elif mime_type in ['.mp4', '.mov']:
+                    st.video(file_path, format="video/mp4")
+                else:
+                    st.warning(f"Media found but cannot display: {os.path.basename(file_path)}")
+            
+        st.markdown("---")
